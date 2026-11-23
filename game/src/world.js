@@ -1,124 +1,104 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+export const SAVE_KEY = 'mirage-bay-save-v1';
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
-
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
-
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
+export function clamp(value, low, high) {
+  return Math.max(low, Math.min(high, value));
 }
 
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
+export function distance(a, b) {
+  return Math.hypot(a.x - b.x, a.z - b.z);
+}
+
+export function createWorld() {
+  const player = { x: 3, z: 14, heading: 0, health: 100 };
+  const coupe = { x: 3, z: 10, heading: 0, color: '#ff4f78', type: 'coupe' };
+  const vehicles = [
+    coupe,
+    { x: -20, z: -18, heading: Math.PI, color: '#71ddd8', type: 'sedan', speed: 7 },
+    { x: 19, z: 38, heading: -Math.PI / 2, color: '#f6ca70', type: 'sedan', speed: 6 },
+  ];
+  const police = [];
+  const pedestrians = [];
+  for (let i = 0; i < 14; i += 1) {
+    pedestrians.push({
+      x: i % 2 ? -13 - (i % 4) : 13 + (i % 5),
+      z: -48 + i * 7,
+      heading: i % 2 ? Math.PI : 0,
+      speed: 0.8 + (i % 3) * 0.24,
+      hue: i % 3,
+    });
   }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
+  const state = {
+    player, vehicles, police, pedestrians, inVehicle: null, stage: 0,
+    wanted: 0, wantedHeat: 0, emp: 100, elapsed: 0,
+    missionText: 'Meet Sol at Palm Row',
+    district: 'Palisade Avenue',
+  };
 
   function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+    player.x = 3; player.z = 14; player.heading = 0;
+    coupe.x = 3; coupe.z = 10; coupe.heading = 0;
+    police.length = 0;
+    Object.assign(state, { inVehicle: null, stage: 0, wanted: 0, wantedHeat: 0, emp: 100,
+      missionText: 'Meet Sol at Palm Row', district: 'Palisade Avenue' });
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
+  function save() {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify({
+        px: player.x, pz: player.z, stage: state.stage, wanted: state.wanted,
+      }));
+    } catch (_) {}
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  let lastSave = 0;
+  function saveThrottled(now = Date.now()) {
+    if (now - lastSave < 1500) return;
+    lastSave = now;
+    save();
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
+  function load() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(SAVE_KEY));
+      if (!saved) return false;
+      player.x = clamp(saved.px || 0, -46, 46);
+      player.z = clamp(saved.pz || 18, -78, 78);
+      state.stage = clamp(saved.stage || 0, 0, 5);
+      state.wanted = clamp(saved.wanted || 0, 0, 5);
+      updateMission();
+      return true;
+    } catch (_) { return false; }
   }
 
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
+  function updateMission() {
+    const missions = [
+      'Meet Sol at Palm Row',
+      'Find the coral coupe',
+      'Take the coupe to Harborlight',
+      'Lose the patrol — stay moving',
+      'Fire EMP to clear the road',
+      'Return to Sol at Palm Row',
+    ];
+    state.missionText = missions[state.stage];
   }
 
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
+  function advance() {
+    state.stage = Math.min(5, state.stage + 1);
+    state.wanted = 0;
+    state.wantedHeat = 0;
+    updateMission();
+    save();
+  }
 
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
+  function collision(x, z) {
+    if (x < -48 || x > 48 || z < -88 || z > 88) return true;
+    for (const bx of [-38, -20, 20, 38]) {
+      for (const bz of [-68, -38, -8, 22, 52]) {
+        if (Math.abs(x - bx) < 6 && Math.abs(z - bz) < 7) return true;
       }
     }
-    return events;
+    return false;
   }
 
-  reset();
-  return { state, reset, step };
+  return { state, reset, save, saveThrottled, load, advance, updateMission, collision };
 }
